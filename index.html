@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Broken Bones: Power Launch</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #050505; font-family: 'Arial Black', sans-serif; color: white; user-select: none; touch-action: none; }
+        #ui { position: absolute; top: 15px; left: 15px; pointer-events: none; z-index: 10; }
+        #controls { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; gap: 8px; z-index: 10; }
+        
+        /* Power Meter Styles */
+        #power-container { width: 200px; height: 15px; background: #333; border-radius: 10px; margin-top: 10px; display: none; overflow: hidden; border: 2px solid #fff; }
+        #power-bar { width: 0%; height: 100%; background: linear-gradient(to right, #44bd32, #fbc531, #d63031); }
+        
+        .btn { 
+            background: #d63031; color: white; border: none; padding: 12px 18px; 
+            border-radius: 8px; font-weight: bold; cursor: pointer; box-shadow: 0 4px #8a1d1d;
+            touch-action: none;
+        }
+        .btn:active { transform: translateY(2px); box-shadow: 0 2px #8a1d1d; }
+        .btn:disabled { background: #444; box-shadow: 0 4px #222; opacity: 0.5; }
+        .btn.balloon-btn { background: #00cec9; box-shadow: 0 4px #009797; color: #000; }
+        .stats { font-size: 18px; color: #fbc531; text-shadow: 2px 2px #000; }
+        #leaderboard { position: absolute; top: 15px; right: 15px; background: rgba(0,0,0,0.7); padding: 10px; border-radius: 10px; font-size: 12px; border: 1px solid #444; }
+        #blood-canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div class="stats">CASH: $<span id="money">0</span></div>
+        <div class="stats">SCORE: <span id="bones">0</span></div>
+        <div id="balloon-timer" style="color:#00cec9; font-size:14px; font-weight:bold;"></div>
+        <div id="power-container"><div id="power-bar"></div></div>
+    </div>
+
+    <div id="leaderboard">
+        <div style="color:#fbc531; border-bottom:1px solid #555; margin-bottom:5px;">TOP FALLS</div>
+        <div id="scores-list"></div>
+    </div>
+
+    <canvas id="blood-canvas"></canvas>
+
+    <div id="controls">
+        <button class="btn" id="launch-btn" onpointerdown="startCharging()" onpointerup="fireCannon()">HOLD TO CHARGE</button>
+        <button class="btn balloon-btn" id="balloon-btn" onclick="useBalloon()">HELIUM (10s)</button>
+        <button class="btn" onclick="toggleShop()">SHOP</button>
+    </div>
+
+    <div id="shop-menu" style="position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(0,0,0,0.95); padding:20px; border-radius:15px; display:none; z-index:100; border:2px solid #00cec9; width:280px;">
+        <h3 style="text-align:center;">SHOP</h3>
+        <div id="shop-items"></div>
+        <button class="btn" style="width:100%; margin-top:10px;" onclick="toggleShop()">CLOSE</button>
+    </div>
+
+    <script>
+        const { Engine, Render, Runner, Bodies, Composite, Constraint, Events, Body, Vector } = Matter;
+        const engine = Engine.create();
+        const world = engine.world;
+        const MAP_HEIGHT = 12000;
+
+        const render = Render.create({
+            element: document.body, engine: engine,
+            options: { width: window.innerWidth, height: window.innerHeight, wireframes: false, background: '#0a0a0a' }
+        });
+
+        let data = JSON.parse(localStorage.getItem('bb_v8_save')) || { cash: 0, grav: 1, steer: 1, fragility: 1, highScores: [] };
+        let currentScore = 0;
+        let currentCharacter = null;
+        let balloonUsed = false;
+        let shopOpen = false;
+        
+        // Power Logic
+        let isCharging = false;
+        let powerLevel = 0;
+        let powerDir = 1;
+
+        const bCanvas = document.getElementById('blood-canvas');
+        const bCtx = bCanvas.getContext('2d');
+        bCanvas.width = window.innerWidth; bCanvas.height = window.innerHeight;
+        let particles = [];
+
+        // --- Environment ---
+        const zoneCount = 5;
+        const zoneWidth = window.innerWidth / zoneCount;
+        const zones = [];
+        for(let i=0; i<zoneCount; i++) {
+            zones.push(Bodies.rectangle((i * zoneWidth) + (zoneWidth/2), MAP_HEIGHT, zoneWidth, 200, { isStatic: true, label: 'zone_'+i, render: { fillStyle: '#111' } }));
+        }
+
+        function populateMap() {
+            const obstacles = [];
+            for(let y = 800; y < MAP_HEIGHT - 500; y += 450) {
+                obstacles.push(Bodies.rectangle(40, y, 200, 25, { isStatic: true, angle: 0.7, render: {fillStyle: '#d63031'} }));
+                obstacles.push(Bodies.rectangle(window.innerWidth - 40, y, 200, 25, { isStatic: true, angle: -0.7, render: {fillStyle: '#d63031'} }));
+            }
+            for(let i=0; i<30; i++) {
+                let rx = Math.random() * (window.innerWidth - 240) + 120;
+                let ry = Math.random() * (MAP_HEIGHT - 1500) + 1200;
+                obstacles.push(Bodies.polygon(rx, ry, 3, 35, { isStatic: true, angle: Math.random(), render: {fillStyle: '#444'} }));
+            }
+            Composite.add(world, [...zones, ...obstacles]);
+        }
+        populateMap();
+
+        function createFullRagdoll(x, y) {
+            const group = Body.nextGroup(true);
+            const head = Bodies.circle(x, y, 15, { collisionFilter: { group }, render: {fillStyle: '#ffdbac'} });
+            const torso = Bodies.rectangle(x, y + 40, 30, 50, { collisionFilter: { group }, render: {fillStyle: '#2ed573'} });
+            const armL = Bodies.rectangle(x-20, y+40, 10, 40, { collisionFilter: { group }, render: {fillStyle: '#2ed573'} });
+            const armR = Bodies.rectangle(x+20, y+40, 10, 40, { collisionFilter: { group }, render: {fillStyle: '#2ed573'} });
+            const legL = Bodies.rectangle(x-10, y+85, 12, 45, { collisionFilter: { group }, render: {fillStyle: '#1e90ff'} });
+            const legR = Bodies.rectangle(x+10, y+85, 12, 45, { collisionFilter: { group }, render: {fillStyle: '#1e90ff'} });
+            const joints = [
+                Constraint.create({ bodyA: head, bodyB: torso, pointA: {x:0, y:12}, pointB: {x:0, y:-25}, stiffness: 0.4 }),
+                Constraint.create({ bodyA: armL, bodyB: torso, pointA: {x:0, y:-15}, pointB: {x:-15, y:-20}, stiffness: 0.4 }),
+                Constraint.create({ bodyA: armR, bodyB: torso, pointA: {x:0, y:-15}, pointB: {x:15, y:-20}, stiffness: 0.4 }),
+                Constraint.create({ bodyA: legL, bodyB: torso, pointA: {x:0, y:-20}, pointB: {x:-8, y:25}, stiffness: 0.4 }),
+                Constraint.create({ bodyA: legR, bodyB: torso, pointA: {x:0, y:-20}, pointB: {x:8, y:25}, stiffness: 0.4 })
+            ];
+            return { comp: Composite.create({ bodies: [head, torso, armL, armR, legL, legR], constraints: joints }), head, torso };
+        }
+
+        // --- Charging Logic ---
+        function startCharging() {
+            if(shopOpen) return;
+            isCharging = true;
+            powerLevel = 0;
+            document.getElementById('power-container').style.display = 'block';
+        }
+
+        function fireCannon() {
+            if(!isCharging) return;
+            isCharging = false;
+            document.getElementById('power-container').style.display = 'none';
+
+            if(currentCharacter) {
+                data.highScores.push(currentScore);
+                data.highScores.sort((a,b) => b-a);
+                data.highScores = data.highScores.slice(0, 5);
+                save();
+                Composite.remove(world, currentCharacter.comp);
+                zones.forEach(z => z.render.fillStyle = '#111');
+            }
+
+            currentScore = 0; balloonUsed = false;
+            document.getElementById('balloon-btn').disabled = false;
+            engine.gravity.y = data.grav;
+
+            const spawnX = window.innerWidth / 2;
+            const spawnY = 500;
+            currentCharacter = createFullRagdoll(spawnX, spawnY);
+            Composite.add(world, currentCharacter.comp);
+            
+            // 70 Degree Launch with Power
+            const angle = -70 * (Math.PI / 180); 
+            const finalForce = (powerLevel / 100) * 0.4; // Scaled force
+            const force = { x: Math.cos(angle) * finalForce, y: Math.sin(angle) * finalForce };
+            
+            Body.applyForce(currentCharacter.head, currentCharacter.head.position, force);
+            updateUI();
+        }
+
+        function useBalloon() {
+            if(!currentCharacter || balloonUsed) return;
+            balloonUsed = true;
+            document.getElementById('balloon-btn').disabled = true;
+            engine.gravity.y = -0.06; 
+            let time = 10;
+            const timer = setInterval(() => {
+                time--;
+                document.getElementById('balloon-timer').innerText = `BALLOON: ${time}s`;
+                if(time <= 0) {
+                    clearInterval(timer);
+                    engine.gravity.y = data.grav;
+                    document.getElementById('balloon-timer').innerText = "";
+                }
+            }, 1000);
+        }
+
+        function buy(type) {
+            if(type === 'grav' && data.grav >= 2.0) return;
+            let cost = Math.floor(100 * (type === 'grav' ? data.grav : type === 'steer' ? data.steer : data.fragility));
+            if(data.cash >= cost) { data.cash -= cost; data[type] += (type === 'grav' ? 0.5 : 1); save(); updateUI(); }
+        }
+
+        Events.on(engine, 'collisionStart', (e) => {
+            e.pairs.forEach(p => {
+                const speed = currentCharacter ? currentCharacter.torso.speed : 0;
+                if(p.bodyA.label.startsWith('zone_') || p.bodyB.label.startsWith('zone_')) {
+                    const zone = p.bodyA.label.startsWith('zone_') ? p.bodyA : p.bodyB;
+                    zone.render.fillStyle = '#fbc531';
+                }
+                if(speed > 2.5) {
+                    spawnBlood(p.collision.supports[0].x, p.collision.supports[0].y, speed);
+                    currentScore += Math.floor(speed);
+                    data.cash += Math.floor(speed * data.fragility);
+                    save(); updateUI();
+                }
+            });
+        });
+
+        // --- Loop Functions ---
+        function update() {
+            if(isCharging) {
+                powerLevel += 2 * powerDir;
+                if(powerLevel >= 100 || powerLevel <= 0) powerDir *= -1;
+                document.getElementById('power-bar').style.width = powerLevel + '%';
+            }
+            
+            if(currentCharacter) {
+                const targetY = currentCharacter.torso.position.y - window.innerHeight/2;
+                Render.lookAt(render, { min: {x:0, y:targetY}, max: {x:window.innerWidth, y:targetY+window.innerHeight} });
+            }
+            
+            bCtx.clearRect(0,0,bCanvas.width, bCanvas.height);
+            particles = particles.filter(p => {
+                p.x += p.vx; p.y += p.vy; p.life -= 0.02;
+                bCtx.fillStyle = `rgba(220, 0, 0, ${p.life})`;
+                bCtx.beginPath(); bCtx.arc(p.x, p.y - (currentCharacter ? currentCharacter.torso.position.y - window.innerHeight/2 : 0), p.size, 0, Math.PI*2); bCtx.fill();
+                return p.life > 0;
+            });
+            requestAnimationFrame(update);
+        }
+
+        window.addEventListener('touchstart', e => {
+            if(!currentCharacter || isCharging) return;
+            const dir = e.touches[0].clientX < window.innerWidth/2 ? -1 : 1;
+            Body.applyForce(currentCharacter.torso, currentCharacter.torso.position, {x: 0.012 * data.steer * dir, y: 0});
+        });
+
+        function spawnBlood(x, y, s) { for(let i=0; i<6; i++) particles.push({ x, y, vx: (Math.random()-0.5)*s, vy: (Math.random()-0.5)*s, life: 1, size: Math.random()*2+2 }); }
+        function toggleShop() { shopOpen = !shopOpen; document.getElementById('shop-menu').style.display = shopOpen ? 'block' : 'none'; runner.enabled = !shopOpen; }
+        function save() { localStorage.setItem('bb_v8_save', JSON.stringify(data)); }
+
+        function updateUI() {
+            document.getElementById('money').innerText = Math.floor(data.cash);
+            document.getElementById('bones').innerText = currentScore;
+            document.getElementById('scores-list').innerHTML = data.highScores.map((s, i) => `<div>${i+1}. ${s}</div>`).join('');
+            document.getElementById('shop-items').innerHTML = `
+                <div style="display:flex; justify-content:space-between; margin-bottom:10px;">Gravity (Max 2) <button class="btn" onclick="buy('grav')" ${data.grav >= 2 ? 'disabled' : ''}>$${Math.floor(100*data.grav)}</button></div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:10px;">Air Control <button class="btn" onclick="buy('steer')">$${Math.floor(100*data.steer)}</button></div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:10px;">Fragility <button class="btn" onclick="buy('cash')">$${Math.floor(100*data.fragility)}</button></div>
+            `;
+        }
+
+        Render.run(render);
+        const runner = Runner.run(engine);
+        update();
+        updateUI();
+    </script>
+</body>
+</html>
