@@ -46,6 +46,7 @@
     <div id="controls">
         <button class="btn" id="launch-btn" onpointerdown="startCharging()" onpointerup="fireCannon()">HOLD TO CHARGE</button>
         <button class="btn balloon-btn" id="balloon-btn" onclick="useBalloon()">HELIUM (10s)</button>
+        <button class="btn" style="background: #ffa502;" id="sword-btn" onclick="cutCharacter()">SWORD</button>
         <button class="btn" onclick="toggleShop()">SHOP</button>
     </div>
 
@@ -101,6 +102,16 @@
                 let ry = Math.random() * (MAP_HEIGHT - 1500) + 1200;
                 obstacles.push(Bodies.polygon(rx, ry, 3, 35, { isStatic: true, angle: Math.random(), render: {fillStyle: '#444'} }));
             }
+            // Add some Sword Obstacles
+            for(let i=0; i<15; i++) {
+                let sx = Math.random() * (window.innerWidth - 100) + 50;
+                let sy = Math.random() * (MAP_HEIGHT - 2000) + 1000;
+                obstacles.push(Bodies.rectangle(sx, sy, 80, 4, { 
+                    isStatic: true, angle: Math.random() * Math.PI, 
+                    label: 'sword_obstacle',
+                    render: {fillStyle: '#ffa502', strokeStyle: '#fff', lineWidth: 2} 
+                }));
+            }
             Composite.add(world, [...zones, ...obstacles]);
         }
         populateMap();
@@ -114,13 +125,70 @@
             const legL = Bodies.rectangle(x-10, y+85, 12, 45, { collisionFilter: { group }, render: {fillStyle: '#1e90ff'} });
             const legR = Bodies.rectangle(x+10, y+85, 12, 45, { collisionFilter: { group }, render: {fillStyle: '#1e90ff'} });
             const joints = [
-                Constraint.create({ bodyA: head, bodyB: torso, pointA: {x:0, y:12}, pointB: {x:0, y:-25}, stiffness: 0.4 }),
-                Constraint.create({ bodyA: armL, bodyB: torso, pointA: {x:0, y:-15}, pointB: {x:-15, y:-20}, stiffness: 0.4 }),
-                Constraint.create({ bodyA: armR, bodyB: torso, pointA: {x:0, y:-15}, pointB: {x:15, y:-20}, stiffness: 0.4 }),
-                Constraint.create({ bodyA: legL, bodyB: torso, pointA: {x:0, y:-20}, pointB: {x:-8, y:25}, stiffness: 0.4 }),
-                Constraint.create({ bodyA: legR, bodyB: torso, pointA: {x:0, y:-20}, pointB: {x:8, y:25}, stiffness: 0.4 })
+                Constraint.create({ bodyA: head, bodyB: torso, pointA: {x:0, y:12}, pointB: {x:0, y:-25}, stiffness: 0.4, label: 'head_joint' }),
+                Constraint.create({ bodyA: armL, bodyB: torso, pointA: {x:0, y:-15}, pointB: {x:-15, y:-20}, stiffness: 0.4, label: 'armL_joint' }),
+                Constraint.create({ bodyA: armR, bodyB: torso, pointA: {x:0, y:-15}, pointB: {x:15, y:-20}, stiffness: 0.4, label: 'armR_joint' }),
+                Constraint.create({ bodyA: legL, bodyB: torso, pointA: {x:0, y:-20}, pointB: {x:-8, y:25}, stiffness: 0.4, label: 'legL_joint' }),
+                Constraint.create({ bodyA: legR, bodyB: torso, pointA: {x:0, y:-20}, pointB: {x:8, y:25}, stiffness: 0.4, label: 'legR_joint' })
             ];
-            return { comp: Composite.create({ bodies: [head, torso, armL, armR, legL, legR], constraints: joints }), head, torso };
+            const bodies = [head, torso, armL, armR, legL, legR];
+            return { comp: Composite.create({ bodies, constraints: joints }), head, torso, scoringBodies: bodies, isCut: false };
+        }
+
+        function cutCharacter() {
+            if(!currentCharacter || currentCharacter.isCut) return;
+            currentCharacter.isCut = true;
+            document.getElementById('sword-btn').disabled = true;
+
+            const { torso, comp } = currentCharacter;
+            const pos = torso.position;
+            const angle = torso.angle;
+            const group = torso.collisionFilter.group;
+
+            // Remove old torso
+            Composite.remove(comp, torso);
+            currentCharacter.scoringBodies = currentCharacter.scoringBodies.filter(b => b !== torso);
+
+            // Create two halves
+            const torsoUpper = Bodies.rectangle(pos.x, pos.y - 12.5, 30, 25, { 
+                collisionFilter: { group }, render: {fillStyle: '#2ed573'}, angle: angle 
+            });
+            const torsoLower = Bodies.rectangle(pos.x, pos.y + 12.5, 30, 25, { 
+                collisionFilter: { group }, render: {fillStyle: '#2ed573'}, angle: angle 
+            });
+
+            Composite.add(comp, [torsoUpper, torsoLower]);
+            currentCharacter.scoringBodies.push(torsoUpper, torsoLower);
+            currentCharacter.torso = torsoUpper; // Keep a reference for camera
+
+            // Re-bind constraints
+            const constraints = [...comp.constraints];
+            constraints.forEach(c => {
+                if(c.bodyB === torso) {
+                    Composite.remove(comp, c);
+                    const isUpper = c.label.includes('head') || c.label.includes('arm');
+                    const target = isUpper ? torsoUpper : torsoLower;
+                    // Adjust offset: old torso was 50 high (-25 to 25). 
+                    // New ones are 25 high (-12.5 to 12.5).
+                    // Upper connection was at -25 local in old torso. 
+                    // In new upper torso (centered at -12.5 relative to old center), 
+                    // -25 in old becomes -12.5 in new.
+                    // Lower connection was at 25 local in old torso.
+                    // In new lower torso (centered at 12.5 relative to old center),
+                    // 25 in old becomes 12.5 in new.
+                    const offset = isUpper ? 12.5 : -12.5;
+                    const newC = Constraint.create({
+                        bodyA: c.bodyA, bodyB: target,
+                        pointA: c.pointA, pointB: { x: c.pointB.x, y: c.pointB.y + offset },
+                        stiffness: c.stiffness, label: c.label
+                    });
+                    Composite.add(comp, newC);
+                }
+            });
+            
+            // Apply a little "explosion" to separate them
+            Body.applyForce(torsoUpper, torsoUpper.position, {x: (Math.random()-0.5)*0.05, y: -0.05});
+            Body.applyForce(torsoLower, torsoLower.position, {x: (Math.random()-0.5)*0.05, y: 0.05});
         }
 
         // --- Charging Logic ---
@@ -135,6 +203,7 @@
             if(!isCharging) return;
             isCharging = false;
             document.getElementById('power-container').style.display = 'none';
+            document.getElementById('sword-btn').disabled = false;
 
             if(currentCharacter) {
                 data.highScores.push(currentScore);
@@ -188,16 +257,28 @@
 
         Events.on(engine, 'collisionStart', (e) => {
             e.pairs.forEach(p => {
-                const speed = currentCharacter ? currentCharacter.torso.speed : 0;
+                if(!currentCharacter) return;
+
                 if(p.bodyA.label.startsWith('zone_') || p.bodyB.label.startsWith('zone_')) {
                     const zone = p.bodyA.label.startsWith('zone_') ? p.bodyA : p.bodyB;
                     zone.render.fillStyle = '#fbc531';
                 }
-                if(speed > 2.5) {
-                    spawnBlood(p.collision.supports[0].x, p.collision.supports[0].y, speed);
-                    currentScore += Math.floor(speed);
-                    data.cash += Math.floor(speed * data.fragility);
-                    save(); updateUI();
+
+                // Trigger Sword Cut if hitting a sword obstacle
+                if(p.bodyA.label === 'sword_obstacle' || p.bodyB.label === 'sword_obstacle') {
+                    cutCharacter();
+                }
+
+                // Check if any of our scoring bodies collided
+                const bodyPart = currentCharacter.scoringBodies.find(b => b === p.bodyA || b === p.bodyB);
+                if(bodyPart) {
+                    const speed = bodyPart.speed;
+                    if(speed > 2.5) {
+                        spawnBlood(p.collision.supports[0].x, p.collision.supports[0].y, speed);
+                        currentScore += Math.floor(speed);
+                        data.cash += Math.floor(speed * data.fragility);
+                        save(); updateUI();
+                    }
                 }
             });
         });
